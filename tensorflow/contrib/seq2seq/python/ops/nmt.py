@@ -1,629 +1,590 @@
-# Copyright 2017 Google Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 
-"""Basic sequence-to-sequence model with dynamic RNN support."""
-from __future__ import absolute_import
-from __future__ import division
 from __future__ import print_function
 
-import abc
+import argparse
+import os
+import random
+import sys
 
+# import matplotlib.image as mpimg
+import numpy as np
 import tensorflow as tf
 
-from tensorflow.python.layers import core as layers_core
-
-from . import model_helper
-from .utils import iterator_utils
+from . import inference
+from . import train
+from .utils import evaluation_utils
 from .utils import misc_utils as utils
+from .utils import vocab_utils
 
 utils.check_tensorflow_version()
 
-__all__ = ["BaseModel", "Model"]
-
-
-class BaseModel(object):
-  """Sequence-to-sequence base class.
-  """
-
-  def __init__(self,
-               hparams,
-               mode,
-               iterator,
-               source_vocab_table,
-               target_vocab_table,
-               reverse_target_vocab_table=None,
-               scope=None,
-               extra_args=None):
-    """Create the model.
-    Args:
-      hparams: Hyperparameter configurations.
-      mode: TRAIN | EVAL | INFER
-      iterator: Dataset Iterator that feeds data.
-      source_vocab_table: Lookup table mapping source words to ids.
-      target_vocab_table: Lookup table mapping target words to ids.
-      reverse_target_vocab_table: Lookup table mapping ids to target words. Only
-        required in INFER mode. Defaults to None.
-      scope: scope of the model.
-      extra_args: model_helper.ExtraArgs, for passing customizable functions.
-    """
-    assert isinstance(iterator, iterator_utils.BatchedInput)
-    self.iterator = iterator
-    self.mode = mode
-    self.src_vocab_table = source_vocab_table
-    self.tgt_vocab_table = target_vocab_table
-
-    self.src_vocab_size = hparams.src_vocab_size
-    self.tgt_vocab_size = hparams.tgt_vocab_size
-    self.num_layers = hparams.num_layers
-    self.num_gpus = hparams.num_gpus
-    self.time_major = hparams.time_major
-
-    # extra_args: to make it flexible for adding external customizable code
-    self.single_cell_fn = None
-    if extra_args:
-      self.single_cell_fn = extra_args.single_cell_fn
-
-    # Initializer
-    initializer = model_helper.get_initializer(
-        hparams.init_op, hparams.random_seed, hparams.init_weight)
-    tf.get_variable_scope().set_initializer(initializer)
-
-    # Embeddings
-    # TODO(ebrevdo): Only do this if the mode is TRAIN?
-    self.init_embeddings(hparams, scope)
-    self.batch_size = tf.size(self.iterator.source_sequence_length)
-
-    # Projection
-    with tf.variable_scope(scope or "build_network"):
-      with tf.variable_scope("decoder/output_projection"):
-        self.output_layer = layers_core.Dense(
-            hparams.tgt_vocab_size, use_bias=False, name="output_projection")
-
-    ## Train graph
-    res = self.build_graph(hparams, scope=scope)
-
-    if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
-      self.train_loss = res[1]
-      self.word_count = tf.reduce_sum(
-          self.iterator.source_sequence_length) + tf.reduce_sum(
-              self.iterator.target_sequence_length)
-    elif self.mode == tf.contrib.learn.ModeKeys.EVAL:
-      self.eval_loss = res[1]
-    elif self.mode == tf.contrib.learn.ModeKeys.INFER:
-      self.infer_logits, _, self.final_context_state, self.sample_id = res
-      self.sample_words = reverse_target_vocab_table.lookup(
-          tf.to_int64(self.sample_id))
-
-    if self.mode != tf.contrib.learn.ModeKeys.INFER:
-      ## Count the number of predicted words for compute ppl.
-      self.predict_count = tf.reduce_sum(
-          self.iterator.target_sequence_length)
-
-    self.global_step = tf.Variable(0, trainable=False)
-    params = tf.trainable_variables()
-
-    # Gradients and SGD update operation for training the model.
-    # Arrage for the embedding vars to appear at the beginning.
-    if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
-      self.learning_rate = tf.constant(hparams.learning_rate)
-      # warm-up
-      self.learning_rate = self._get_learning_rate_warmup(hparams)
-      # decay
-      self.learning_rate = self._get_learning_rate_decay(hparams)
-
-      # Optimizer
-      if hparams.optimizer == "sgd":
-        opt = tf.train.GradientDescentOptimizer(self.learning_rate)
-        tf.summary.scalar("lr", self.learning_rate)
-      elif hparams.optimizer == "adam":
-        assert float(
-            hparams.learning_rate
-        ) <= 0.001, "! High Adam learning rate %g" % hparams.learning_rate
-        opt = tf.train.AdamOptimizer(self.learning_rate)
-
-      # Gradients
-      gradients = tf.gradients(
-          self.train_loss,
-          params,
-          colocate_gradients_with_ops=hparams.colocate_gradients_with_ops)
-
-      clipped_gradients, gradient_norm_summary = model_helper.gradient_clip(
-          gradients, max_gradient_norm=hparams.max_gradient_norm)
-
-      self.update = opt.apply_gradients(
-          zip(clipped_gradients, params), global_step=self.global_step)
-
-      # Summary
-      self.train_summary = tf.summary.merge([
-          tf.summary.scalar("lr", self.learning_rate),
-          tf.summary.scalar("train_loss", self.train_loss),
-      ] + gradient_norm_summary)
-
-    if self.mode == tf.contrib.learn.ModeKeys.INFER:
-      self.infer_summary = self._get_infer_summary(hparams)
-
-    # Saver
-    self.saver = tf.train.Saver(tf.global_variables())
-
-    # Print trainable variables
-    utils.print_out("# Trainable variables")
-    for param in params:
-      utils.print_out("  %s, %s, %s" % (param.name, str(param.get_shape()),
-                                        param.op.device))
-
-  def _get_learning_rate_warmup(self, hparams):
-    """Get learning rate warmup."""
-    warmup_steps = hparams.learning_rate_warmup_steps
-    warmup_factor = hparams.learning_rate_warmup_factor
-    print("  learning_rate=%g, learning_rate_warmup_steps=%d, "
-          "learning_rate_warmup_factor=%g, starting_learning_rate=%g" %
-          (hparams.learning_rate, warmup_steps, warmup_factor,
-           (hparams.learning_rate * warmup_factor ** warmup_steps)))
-
-    # Apply inverse decay if global steps less than warmup steps.
-    # Inspired by https://arxiv.org/pdf/1706.03762.pdf (Section 5.3)
-    # When step < warmup_steps,
-    #   learing_rate *= warmup_factor ** (warmup_steps - step)
-    inv_decay = warmup_factor**(
-        tf.to_float(warmup_steps - self.global_step))
-
-    return tf.cond(
-        self.global_step < hparams.learning_rate_warmup_steps,
-        lambda: inv_decay * self.learning_rate,
-        lambda: self.learning_rate,
-        name="learning_rate_warump_cond")
-
-  def _get_learning_rate_decay(self, hparams):
-    """Get learning rate decay."""
-    if (hparams.learning_rate_decay_scheme and
-        hparams.learning_rate_decay_scheme == "luong"):
-      start_decay_step = int(hparams.num_train_steps / 2)
-      decay_steps = int(hparams.num_train_steps / 10)  # decay 5 times
-      decay_factor = 0.5
-    else:
-      start_decay_step = hparams.start_decay_step
-      decay_steps = hparams.decay_steps
-      decay_factor = hparams.decay_factor
-    print("  decay_scheme=%s, start_decay_step=%d, decay_steps %d, "
-          "decay_factor %g" %
-          (hparams.learning_rate_decay_scheme,
-           hparams.start_decay_step, hparams.decay_steps, hparams.decay_factor))
-
-    return tf.cond(
-        self.global_step < start_decay_step,
-        lambda: self.learning_rate,
-        lambda: tf.train.exponential_decay(
-            self.learning_rate,
-            (self.global_step - start_decay_step),
-            decay_steps, decay_factor, staircase=True),
-        name="learning_rate_decay_cond")
-
-  def init_embeddings(self, hparams, scope):
-    """Init embeddings."""
-    self.embedding_encoder, self.embedding_decoder = (
-        model_helper.create_emb_for_encoder_and_decoder(
-            share_vocab=hparams.share_vocab,
-            src_vocab_size=self.src_vocab_size,
-            tgt_vocab_size=self.tgt_vocab_size,
-            src_embed_size=hparams.num_units,
-            tgt_embed_size=hparams.num_units,
-            num_partitions=hparams.num_embeddings_partitions,
-            scope=scope,))
-
-  def train(self, sess):
-    assert self.mode == tf.contrib.learn.ModeKeys.TRAIN
-    return sess.run([self.update,
-                     self.train_loss,
-                     self.predict_count,
-                     self.train_summary,
-                     self.global_step,
-                     self.word_count,
-                     self.batch_size])
-
-  def eval(self, sess):
-    assert self.mode == tf.contrib.learn.ModeKeys.EVAL
-    return sess.run([self.eval_loss,
-                     self.predict_count,
-                     self.batch_size])
-
-  def build_graph(self, hparams, scope=None):
-    """Subclass must implement this method.
-    Creates a sequence-to-sequence model with dynamic RNN decoder API.
-    Args:
-      hparams: Hyperparameter configurations.
-      scope: VariableScope for the created subgraph; default "dynamic_seq2seq".
-    Returns:
-      A tuple of the form (logits, loss, final_context_state),
-      where:
-        logits: float32 Tensor [batch_size x num_decoder_symbols].
-        loss: the total loss / batch_size.
-        final_context_state: The final state of decoder RNN.
-    Raises:
-      ValueError: if encoder_type differs from mono and bi, or
-        attention_option is not (luong | scaled_luong |
-        bahdanau | normed_bahdanau).
-    """
-    utils.print_out("# creating %s graph ..." % self.mode)
-    dtype = tf.float32
-    num_layers = hparams.num_layers
-    num_gpus = hparams.num_gpus
-
-    with tf.variable_scope(scope or "dynamic_seq2seq", dtype=dtype):
-      # Encoder
-      encoder_outputs, encoder_state = self._build_encoder(hparams)
-
-      ## Decoder
-      logits, sample_id, final_context_state = self._build_decoder(
-          encoder_outputs, encoder_state, hparams)
-
-      ## Loss
-      if self.mode != tf.contrib.learn.ModeKeys.INFER:
-        with tf.device(model_helper.get_device_str(num_layers - 1, num_gpus)):
-          loss = self._compute_loss(logits)
-      else:
-        loss = None
-
-      return logits, loss, final_context_state, sample_id
-
-  @abc.abstractmethod
-  def _build_encoder(self, hparams):
-    """Subclass must implement this.
-    Build and run an RNN encoder.
-    Args:
-      hparams: Hyperparameters configurations.
-    Returns:
-      A tuple of encoder_outputs and encoder_state.
-    """
-    pass
-
-  def _build_encoder_cell(self, hparams, num_layers, num_residual_layers,
-                          base_gpu=0):
-    """Build a multi-layer RNN cell that can be used by encoder."""
-
-    return model_helper.create_rnn_cell(
-        unit_type=hparams.unit_type,
-        num_units=hparams.num_units,
-        num_layers=num_layers,
-        num_residual_layers=num_residual_layers,
-        forget_bias=hparams.forget_bias,
-        dropout=hparams.dropout,
-        num_gpus=hparams.num_gpus,
-        mode=self.mode,
-        base_gpu=base_gpu,
-        single_cell_fn=self.single_cell_fn)
-
-  def _get_infer_maximum_iterations(self, hparams, source_sequence_length):
-    """Maximum decoding steps at inference time."""
-    if hparams.tgt_max_len_infer:
-      maximum_iterations = hparams.tgt_max_len_infer
-      utils.print_out("  decoding maximum_iterations %d" % maximum_iterations)
-    else:
-      # TODO(thangluong): add decoding_length_factor flag
-      decoding_length_factor = 2.0
-      max_encoder_length = tf.reduce_max(source_sequence_length)
-      maximum_iterations = tf.to_int32(tf.round(
-          tf.to_float(max_encoder_length) * decoding_length_factor))
-    return maximum_iterations
-
-  def _build_decoder(self, encoder_outputs, encoder_state, hparams):
-    """Build and run a RNN decoder with a final projection layer.
-    Args:
-      encoder_outputs: The outputs of encoder for every time step.
-      encoder_state: The final state of the encoder.
-      hparams: The Hyperparameters configurations.
-    Returns:
-      A tuple of final logits and final decoder state:
-        logits: size [time, batch_size, vocab_size] when time_major=True.
-    """
-    tgt_sos_id = tf.cast(self.tgt_vocab_table.lookup(tf.constant(hparams.sos)),
-                         tf.int32)
-    tgt_eos_id = tf.cast(self.tgt_vocab_table.lookup(tf.constant(hparams.eos)),
-                         tf.int32)
-
-    num_layers = hparams.num_layers
-    num_gpus = hparams.num_gpus
-
-    iterator = self.iterator
-
-    # maximum_iteration: The maximum decoding steps.
-    maximum_iterations = self._get_infer_maximum_iterations(
-        hparams, iterator.source_sequence_length)
-
-    ## Decoder.
-    with tf.variable_scope("decoder") as decoder_scope:
-      cell, decoder_initial_state = self._build_decoder_cell(
-          hparams, encoder_outputs, encoder_state,
-          iterator.source_sequence_length)
-
-      ## Train or eval
-      if self.mode != tf.contrib.learn.ModeKeys.INFER:
-        # decoder_emp_inp: [max_time, batch_size, num_units]
-        target_input = iterator.target_input
-        if self.time_major:
-          target_input = tf.transpose(target_input)
-        decoder_emb_inp = tf.nn.embedding_lookup(
-            self.embedding_decoder, target_input)
-
-        # Helper
-        helper = tf.contrib.seq2seq.TrainingHelper(
-            decoder_emb_inp, iterator.target_sequence_length,
-            time_major=self.time_major)
-
-        # Decoder
-        my_decoder = tf.contrib.seq2seq.BasicDecoder(
-            cell,
-            helper,
-            decoder_initial_state,)
-
-        # Dynamic decoding
-        outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
-            my_decoder,
-            output_time_major=self.time_major,
-            swap_memory=True,
-            scope=decoder_scope)
-
-        sample_id = outputs.sample_id
-
-        # Note: there's a subtle difference here between train and inference.
-        # We could have set output_layer when create my_decoder
-        #   and shared more code between train and inference.
-        # We chose to apply the output_layer to all timesteps for speed:
-        #   10% improvements for small models & 20% for larger ones.
-        # If memory is a concern, we should apply output_layer per timestep.
-        device_id = num_layers if num_layers < num_gpus else (num_layers - 1)
-        with tf.device(model_helper.get_device_str(device_id, num_gpus)):
-          logits = self.output_layer(outputs.rnn_output)
-
-      ## Inference
-      else:
-        beam_width = hparams.beam_width
-        length_penalty_weight = hparams.length_penalty_weight
-        start_tokens = tf.fill([self.batch_size], tgt_sos_id)
-        end_token = tgt_eos_id
-
-        if beam_width > 0:
-          my_decoder = tf.contrib.seq2seq.BeamSearchDecoder(
-              cell=cell,
-              embedding=self.embedding_decoder,
-              start_tokens=start_tokens,
-              end_token=end_token,
-              initial_state=decoder_initial_state,
-              beam_width=beam_width,
-              output_layer=self.output_layer,
-              length_penalty_weight=length_penalty_weight)
-        else:
-          # Helper
-          helper = tf.contrib.seq2seq.GreedyEmbeddingHelper(
-              self.embedding_decoder, start_tokens, end_token)
-
-          # Decoder
-          my_decoder = tf.contrib.seq2seq.BasicDecoder(
-              cell,
-              helper,
-              decoder_initial_state,
-              output_layer=self.output_layer  # applied per timestep
-          )
-
-        # Dynamic decoding
-        outputs, final_context_state, _ = tf.contrib.seq2seq.dynamic_decode(
-            my_decoder,
-            maximum_iterations=maximum_iterations,
-            output_time_major=self.time_major,
-            swap_memory=True,
-            scope=decoder_scope)
-
-        if beam_width > 0:
-          logits = tf.no_op()
-          sample_id = outputs.predicted_ids
-        else:
-          logits = outputs.rnn_output
-          sample_id = outputs.sample_id
-
-    return logits, sample_id, final_context_state
-
-  def get_max_time(self, tensor):
-    time_axis = 0 if self.time_major else 1
-    return tensor.shape[time_axis].value or tf.shape(tensor)[time_axis]
-
-  @abc.abstractmethod
-  def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length):
-    """Subclass must implement this.
-    Args:
-      hparams: Hyperparameters configurations.
-      encoder_outputs: The outputs of encoder for every time step.
-      encoder_state: The final state of the encoder.
-      source_sequence_length: sequence length of encoder_outputs.
-    Returns:
-      A tuple of a multi-layer RNN cell used by decoder
-        and the intial state of the decoder RNN.
-    """
-    pass
-
-  def _compute_loss(self, logits):
-    """Compute optimization loss."""
-    target_output = self.iterator.target_output
-    if self.time_major:
-      target_output = tf.transpose(target_output)
-    max_time = self.get_max_time(target_output)
-    crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
-        labels=target_output, logits=logits)
-    target_weights = tf.sequence_mask(
-        self.iterator.target_sequence_length, max_time, dtype=logits.dtype)
-    if self.time_major:
-      target_weights = tf.transpose(target_weights)
-
-    loss = tf.reduce_sum(
-        crossent * target_weights) / tf.to_float(self.batch_size)
-    return loss
-
-  def _get_infer_summary(self, hparams):
-    return tf.no_op()
-
-  def infer(self, sess):
-    assert self.mode == tf.contrib.learn.ModeKeys.INFER
-    return sess.run([
-        self.infer_logits, self.infer_summary, self.sample_id, self.sample_words
-    ])
-
-  def decode(self, sess):
-    """Decode a batch.
-    Args:
-      sess: tensorflow session to use.
-    Returns:
-      A tuple consiting of outputs, infer_summary.
-        outputs: of size [batch_size, time]
-    """
-    _, infer_summary, _, sample_words = self.infer(sess)
-
-    # make sure outputs is of shape [batch_size, time]
-    if self.time_major:
-      sample_words = sample_words.transpose()
-    return sample_words, infer_summary
-
-
-class Model(BaseModel):
-  """Sequence-to-sequence dynamic model.
-  This class implements a multi-layer recurrent neural network as encoder,
-  and a multi-layer recurrent neural network decoder.
-  """
-
-  def _build_encoder(self, hparams):
-    """Build an encoder."""
-    num_layers = hparams.num_layers
-    num_residual_layers = hparams.num_residual_layers
-
-    iterator = self.iterator
-
-    source = iterator.source
-    if self.time_major:
-      source = tf.transpose(source)
-
-    with tf.variable_scope("encoder") as scope:
-      dtype = scope.dtype
-      # Look up embedding, emp_inp: [max_time, batch_size, num_units]
-      encoder_emb_inp = tf.nn.embedding_lookup(
-          self.embedding_encoder, source)
-
-      # Encoder_outpus: [max_time, batch_size, num_units]
-      if hparams.encoder_type == "uni":
-        utils.print_out("  num_layers = %d, num_residual_layers=%d" %
-                        (num_layers, num_residual_layers))
-        cell = self._build_encoder_cell(
-            hparams, num_layers, num_residual_layers)
-
-        encoder_outputs, encoder_state = tf.nn.dynamic_rnn(
-            cell,
-            encoder_emb_inp,
-            dtype=dtype,
-            sequence_length=iterator.source_sequence_length,
-            time_major=self.time_major,
-            swap_memory=True)
-      elif hparams.encoder_type == "bi":
-        num_bi_layers = int(num_layers / 2)
-        num_bi_residual_layers = int(num_residual_layers / 2)
-        utils.print_out("  num_bi_layers = %d, num_bi_residual_layers=%d" %
-                        (num_bi_layers, num_bi_residual_layers))
-
-        encoder_outputs, bi_encoder_state = (
-            self._build_bidirectional_rnn(
-                inputs=encoder_emb_inp,
-                sequence_length=iterator.source_sequence_length,
-                dtype=dtype,
-                hparams=hparams,
-                num_bi_layers=num_bi_layers,
-                num_bi_residual_layers=num_bi_residual_layers))
-
-        if num_bi_layers == 1:
-          encoder_state = bi_encoder_state
-        else:
-          # alternatively concat forward and backward states
-          encoder_state = []
-          for layer_id in range(num_bi_layers):
-            encoder_state.append(bi_encoder_state[0][layer_id])  # forward
-            encoder_state.append(bi_encoder_state[1][layer_id])  # backward
-          encoder_state = tuple(encoder_state)
-      else:
-        raise ValueError("Unknown encoder_type %s" % hparams.encoder_type)
-    return encoder_outputs, encoder_state
-
-  def _build_bidirectional_rnn(self, inputs, sequence_length,
-                               dtype, hparams,
-                               num_bi_layers,
-                               num_bi_residual_layers,
-                               base_gpu=0):
-    """Create and call biddirectional RNN cells.
-    Args:
-      num_residual_layers: Number of residual layers from top to bottom. For
-        example, if `num_bi_layers=4` and `num_residual_layers=2`, the last 2 RNN
-        layers in each RNN cell will be wrapped with `ResidualWrapper`.
-      base_gpu: The gpu device id to use for the first forward RNN layer. The
-        i-th forward RNN layer will use `(base_gpu + i) % num_gpus` as its
-        device id. The `base_gpu` for backward RNN cell is `(base_gpu +
-        num_bi_layers)`.
-    Returns:
-      The concatenated bidirectional output and the bidirectional RNN cell"s
-      state.
-    """
-    # Construct forward and backward cells
-    fw_cell = self._build_encoder_cell(hparams,
-                                       num_bi_layers,
-                                       num_bi_residual_layers,
-                                       base_gpu=base_gpu)
-    bw_cell = self._build_encoder_cell(hparams,
-                                       num_bi_layers,
-                                       num_bi_residual_layers,
-                                       base_gpu=(base_gpu + num_bi_layers))
-
-    bi_outputs, bi_state = tf.nn.bidirectional_dynamic_rnn(
-        fw_cell,
-        bw_cell,
-        inputs,
-        dtype=dtype,
-        sequence_length=sequence_length,
-        time_major=self.time_major,
-        swap_memory=True)
-
-    return tf.concat(bi_outputs, -1), bi_state
-
-  def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
-                          source_sequence_length):
-    """Build an RNN cell that can be used by decoder."""
-    # We only make use of encoder_outputs in attention-based models
-    if hparams.attention:
-      raise ValueError("BasicModel doesn't support attention.")
-
-    num_layers = hparams.num_layers
-    num_residual_layers = hparams.num_residual_layers
-
-    cell = model_helper.create_rnn_cell(
-        unit_type=hparams.unit_type,
-        num_units=hparams.num_units,
-        num_layers=num_layers,
-        num_residual_layers=num_residual_layers,
-        forget_bias=hparams.forget_bias,
-        dropout=hparams.dropout,
-        num_gpus=hparams.num_gpus,
-        mode=self.mode,
-        single_cell_fn=self.single_cell_fn)
-
-    # For beam search, we need to replicate encoder infos beam_width times
-    if self.mode == tf.contrib.learn.ModeKeys.INFER and hparams.beam_width > 0:
-      decoder_initial_state = tf.contrib.seq2seq.tile_batch(
-          encoder_state, multiplier=hparams.beam_width)
-    else:
-      decoder_initial_state = encoder_state
-
-    return cell, decoder_initial_state
+FLAGS = None
+
+
+def add_arguments(parser):
+  """Build ArgumentParser."""
+  parser.register("type", "bool", lambda v: v.lower() == "true")
+
+  # network
+  parser.add_argument("--num_units", type=int, default=32, help="Network size.")
+  parser.add_argument("--num_layers", type=int, default=2,
+                      help="Network depth.")
+  parser.add_argument("--num_encoder_layers", type=int, default=None,
+                      help="Encoder depth, equal to num_layers if None.")
+  parser.add_argument("--num_decoder_layers", type=int, default=None,
+                      help="Decoder depth, equal to num_layers if None.")
+  parser.add_argument("--encoder_type", type=str, default="uni", help="""\
+      uni | bi | gnmt.
+      For bi, we build num_encoder_layers/2 bi-directional layers.
+      For gnmt, we build 1 bi-directional layer, and (num_encoder_layers - 1)
+        uni-directional layers.\
+      """)
+  parser.add_argument("--residual", type="bool", nargs="?", const=True,
+                      default=False,
+                      help="Whether to add residual connections.")
+  parser.add_argument("--time_major", type="bool", nargs="?", const=True,
+                      default=True,
+                      help="Whether to use time-major mode for dynamic RNN.")
+  parser.add_argument("--num_embeddings_partitions", type=int, default=0,
+                      help="Number of partitions for embedding vars.")
+
+  # attention mechanisms
+  parser.add_argument("--attention", type=str, default="", help="""\
+      luong | scaled_luong | bahdanau | normed_bahdanau or set to "" for no
+      attention\
+      """)
+  parser.add_argument(
+      "--attention_architecture",
+      type=str,
+      default="standard",
+      help="""\
+      standard | gnmt | gnmt_v2.
+      standard: use top layer to compute attention.
+      gnmt: GNMT style of computing attention, use previous bottom layer to
+          compute attention.
+      gnmt_v2: similar to gnmt, but use current bottom layer to compute
+          attention.\
+      """)
+  parser.add_argument(
+      "--output_attention", type="bool", nargs="?", const=True,
+      default=True,
+      help="""\
+      Only used in standard attention_architecture. Whether use attention as
+      the cell output at each timestep.
+      .\
+      """)
+  parser.add_argument(
+      "--pass_hidden_state", type="bool", nargs="?", const=True,
+      default=True,
+      help="""\
+      Whether to pass encoder's hidden state to decoder when using an attention
+      based model.\
+      """)
+
+  # optimizer
+  parser.add_argument("--optimizer", type=str, default="sgd", help="sgd | adam")
+  parser.add_argument("--learning_rate", type=float, default=1.0,
+                      help="Learning rate. Adam: 0.001 | 0.0001")
+  parser.add_argument("--warmup_steps", type=int, default=0,
+                      help="How many steps we inverse-decay learning.")
+  parser.add_argument("--warmup_scheme", type=str, default="t2t", help="""\
+      How to warmup learning rates. Options include:
+        t2t: Tensor2Tensor's way, start with lr 100 times smaller, then
+             exponentiate until the specified lr.\
+      """)
+  parser.add_argument(
+      "--decay_scheme", type=str, default="", help="""\
+      How we decay learning rate. Options include:
+        luong234: after 2/3 num train steps, we start halving the learning rate
+          for 4 times before finishing.
+        luong5: after 1/2 num train steps, we start halving the learning rate
+          for 5 times before finishing.\
+        luong10: after 1/2 num train steps, we start halving the learning rate
+          for 10 times before finishing.\
+      """)
+
+  parser.add_argument(
+      "--num_train_steps", type=int, default=12000, help="Num steps to train.")
+  parser.add_argument("--colocate_gradients_with_ops", type="bool", nargs="?",
+                      const=True,
+                      default=True,
+                      help=("Whether try colocating gradients with "
+                            "corresponding op"))
+
+  # initializer
+  parser.add_argument("--init_op", type=str, default="uniform",
+                      help="uniform | glorot_normal | glorot_uniform")
+  parser.add_argument("--init_weight", type=float, default=0.1,
+                      help=("for uniform init_op, initialize weights "
+                            "between [-this, this]."))
+
+  # data
+  parser.add_argument("--src", type=str, default=None,
+                      help="Source suffix, e.g., en.")
+  parser.add_argument("--tgt", type=str, default=None,
+                      help="Target suffix, e.g., de.")
+  parser.add_argument("--train_prefix", type=str, default=None,
+                      help="Train prefix, expect files with src/tgt suffixes.")
+  parser.add_argument("--dev_prefix", type=str, default=None,
+                      help="Dev prefix, expect files with src/tgt suffixes.")
+  parser.add_argument("--test_prefix", type=str, default=None,
+                      help="Test prefix, expect files with src/tgt suffixes.")
+  parser.add_argument("--out_dir", type=str, default=None,
+                      help="Store log/model files.")
+
+  # Vocab
+  parser.add_argument("--vocab_prefix", type=str, default=None, help="""\
+      Vocab prefix, expect files with src/tgt suffixes.\
+      """)
+  parser.add_argument("--embed_prefix", type=str, default=None, help="""\
+      Pretrained embedding prefix, expect files with src/tgt suffixes.
+      The embedding files should be Glove formated txt files.\
+      """)
+  parser.add_argument("--sos", type=str, default="<s>",
+                      help="Start-of-sentence symbol.")
+  parser.add_argument("--eos", type=str, default="</s>",
+                      help="End-of-sentence symbol.")
+  parser.add_argument("--share_vocab", type="bool", nargs="?", const=True,
+                      default=False,
+                      help="""\
+      Whether to use the source vocab and embeddings for both source and
+      target.\
+      """)
+  parser.add_argument("--check_special_token", type="bool", default=True,
+                      help="""\
+                      Whether check special sos, eos, unk tokens exist in the
+                      vocab files.\
+                      """)
+
+  # Sequence lengths
+  parser.add_argument("--src_max_len", type=int, default=50,
+                      help="Max length of src sequences during training.")
+  parser.add_argument("--tgt_max_len", type=int, default=50,
+                      help="Max length of tgt sequences during training.")
+  parser.add_argument("--src_max_len_infer", type=int, default=None,
+                      help="Max length of src sequences during inference.")
+  parser.add_argument("--tgt_max_len_infer", type=int, default=None,
+                      help="""\
+      Max length of tgt sequences during inference.  Also use to restrict the
+      maximum decoding length.\
+      """)
+
+  # Default settings works well (rarely need to change)
+  parser.add_argument("--unit_type", type=str, default="lstm",
+                      help="lstm | gru | layer_norm_lstm | nas")
+  parser.add_argument("--forget_bias", type=float, default=1.0,
+                      help="Forget bias for BasicLSTMCell.")
+  parser.add_argument("--dropout", type=float, default=0.2,
+                      help="Dropout rate (not keep_prob)")
+  parser.add_argument("--max_gradient_norm", type=float, default=5.0,
+                      help="Clip gradients to this norm.")
+  parser.add_argument("--batch_size", type=int, default=128, help="Batch size.")
+
+  parser.add_argument("--steps_per_stats", type=int, default=100,
+                      help=("How many training steps to do per stats logging."
+                            "Save checkpoint every 10x steps_per_stats"))
+  parser.add_argument("--max_train", type=int, default=0,
+                      help="Limit on the size of training data (0: no limit).")
+  parser.add_argument("--num_buckets", type=int, default=5,
+                      help="Put data into similar-length buckets.")
+
+  # SPM
+  parser.add_argument("--subword_option", type=str, default="",
+                      choices=["", "bpe", "spm"],
+                      help="""\
+                      Set to bpe or spm to activate subword desegmentation.\
+                      """)
+
+  # Misc
+  parser.add_argument("--num_gpus", type=int, default=1,
+                      help="Number of gpus in each worker.")
+  parser.add_argument("--log_device_placement", type="bool", nargs="?",
+                      const=True, default=False, help="Debug GPU allocation.")
+  parser.add_argument("--metrics", type=str, default="bleu",
+                      help=("Comma-separated list of evaluations "
+                            "metrics (bleu,rouge,accuracy)"))
+  parser.add_argument("--steps_per_external_eval", type=int, default=None,
+                      help="""\
+      How many training steps to do per external evaluation.  Automatically set
+      based on data if None.\
+      """)
+  parser.add_argument("--scope", type=str, default=None,
+                      help="scope to put variables under")
+  parser.add_argument("--hparams_path", type=str, default=None,
+                      help=("Path to standard hparams json file that overrides"
+                            "hparams values from FLAGS."))
+  parser.add_argument("--random_seed", type=int, default=None,
+                      help="Random seed (>0, set a specific seed).")
+  parser.add_argument("--override_loaded_hparams", type="bool", nargs="?",
+                      const=True, default=False,
+                      help="Override loaded hparams with values specified")
+  parser.add_argument("--num_keep_ckpts", type=int, default=5,
+                      help="Max number of checkpoints to keep.")
+  parser.add_argument("--avg_ckpts", type="bool", nargs="?",
+                      const=True, default=False, help=("""\
+                      Average the last N checkpoints for external evaluation.
+                      N can be controlled by setting --num_keep_ckpts.\
+                      """))
+
+  # Inference
+  parser.add_argument("--ckpt", type=str, default="",
+                      help="Checkpoint file to load a model for inference.")
+  parser.add_argument("--inference_input_file", type=str, default=None,
+                      help="Set to the text to decode.")
+  parser.add_argument("--inference_list", type=str, default=None,
+                      help=("A comma-separated list of sentence indices "
+                            "(0-based) to decode."))
+  parser.add_argument("--infer_batch_size", type=int, default=32,
+                      help="Batch size for inference mode.")
+  parser.add_argument("--inference_output_file", type=str, default=None,
+                      help="Output file to store decoding results.")
+  parser.add_argument("--inference_ref_file", type=str, default=None,
+                      help=("""\
+      Reference file to compute evaluation scores (if provided).\
+      """))
+  parser.add_argument("--beam_width", type=int, default=0,
+                      help=("""\
+      beam width when using beam search decoder. If 0 (default), use standard
+      decoder with greedy helper.\
+      """))
+  parser.add_argument("--length_penalty_weight", type=float, default=0.0,
+                      help="Length penalty for beam search.")
+  parser.add_argument("--sampling_temperature", type=float,
+                      default=0.0,
+                      help=("""\
+      Softmax sampling temperature for inference decoding, 0.0 means greedy
+      decoding. This option is ignored when using beam search.\
+      """))
+  parser.add_argument("--num_translations_per_input", type=int, default=1,
+                      help=("""\
+      Number of translations generated for each sentence. This is only used for
+      inference.\
+      """))
+
+  # Job info
+  parser.add_argument("--jobid", type=int, default=0,
+                      help="Task id of the worker.")
+  parser.add_argument("--num_workers", type=int, default=1,
+                      help="Number of workers (inference only).")
+  parser.add_argument("--num_inter_threads", type=int, default=0,
+                      help="number of inter_op_parallelism_threads")
+  parser.add_argument("--num_intra_threads", type=int, default=0,
+                      help="number of intra_op_parallelism_threads")
+
+
+def create_hparams(flags):
+  """Create training hparams."""
+  return tf.contrib.training.HParams(
+      # Data
+      src=flags.src,
+      tgt=flags.tgt,
+      train_prefix=flags.train_prefix,
+      dev_prefix=flags.dev_prefix,
+      test_prefix=flags.test_prefix,
+      vocab_prefix=flags.vocab_prefix,
+      embed_prefix=flags.embed_prefix,
+      out_dir=flags.out_dir,
+
+      # Networks
+      num_units=flags.num_units,
+      num_layers=flags.num_layers,  # Compatible
+      num_encoder_layers=(flags.num_encoder_layers or flags.num_layers),
+      num_decoder_layers=(flags.num_decoder_layers or flags.num_layers),
+      dropout=flags.dropout,
+      unit_type=flags.unit_type,
+      encoder_type=flags.encoder_type,
+      residual=flags.residual,
+      time_major=flags.time_major,
+      num_embeddings_partitions=flags.num_embeddings_partitions,
+
+      # Attention mechanisms
+      attention=flags.attention,
+      attention_architecture=flags.attention_architecture,
+      output_attention=flags.output_attention,
+      pass_hidden_state=flags.pass_hidden_state,
+
+      # Train
+      optimizer=flags.optimizer,
+      num_train_steps=flags.num_train_steps,
+      batch_size=flags.batch_size,
+      init_op=flags.init_op,
+      init_weight=flags.init_weight,
+      max_gradient_norm=flags.max_gradient_norm,
+      learning_rate=flags.learning_rate,
+      warmup_steps=flags.warmup_steps,
+      warmup_scheme=flags.warmup_scheme,
+      decay_scheme=flags.decay_scheme,
+      colocate_gradients_with_ops=flags.colocate_gradients_with_ops,
+
+      # Data constraints
+      num_buckets=flags.num_buckets,
+      max_train=flags.max_train,
+      src_max_len=flags.src_max_len,
+      tgt_max_len=flags.tgt_max_len,
+
+      # Inference
+      src_max_len_infer=flags.src_max_len_infer,
+      tgt_max_len_infer=flags.tgt_max_len_infer,
+      infer_batch_size=flags.infer_batch_size,
+      beam_width=flags.beam_width,
+      length_penalty_weight=flags.length_penalty_weight,
+      sampling_temperature=flags.sampling_temperature,
+      num_translations_per_input=flags.num_translations_per_input,
+
+      # Vocab
+      sos=flags.sos if flags.sos else vocab_utils.SOS,
+      eos=flags.eos if flags.eos else vocab_utils.EOS,
+      subword_option=flags.subword_option,
+      check_special_token=flags.check_special_token,
+
+      # Misc
+      forget_bias=flags.forget_bias,
+      num_gpus=flags.num_gpus,
+      epoch_step=0,  # record where we were within an epoch.
+      steps_per_stats=flags.steps_per_stats,
+      steps_per_external_eval=flags.steps_per_external_eval,
+      share_vocab=flags.share_vocab,
+      metrics=flags.metrics.split(","),
+      log_device_placement=flags.log_device_placement,
+      random_seed=flags.random_seed,
+      override_loaded_hparams=flags.override_loaded_hparams,
+      num_keep_ckpts=flags.num_keep_ckpts,
+      avg_ckpts=flags.avg_ckpts,
+      num_intra_threads=flags.num_intra_threads,
+      num_inter_threads=flags.num_inter_threads,
+  )
+
+
+def extend_hparams(hparams):
+  """Extend training hparams."""
+  assert hparams.num_encoder_layers and hparams.num_decoder_layers
+  if hparams.num_encoder_layers != hparams.num_decoder_layers:
+    hparams.pass_hidden_state = False
+    utils.print_out("Num encoder layer %d is different from num decoder layer"
+                    " %d, so set pass_hidden_state to False" % (
+                        hparams.num_encoder_layers,
+                        hparams.num_decoder_layers))
+
+  # Sanity checks
+  if hparams.encoder_type == "bi" and hparams.num_encoder_layers % 2 != 0:
+    raise ValueError("For bi, num_encoder_layers %d should be even" %
+                     hparams.num_encoder_layers)
+  if (hparams.attention_architecture in ["gnmt"] and
+      hparams.num_encoder_layers < 2):
+    raise ValueError("For gnmt attention architecture, "
+                     "num_encoder_layers %d should be >= 2" %
+                     hparams.num_encoder_layers)
+
+  # Set residual layers
+  num_encoder_residual_layers = 0
+  num_decoder_residual_layers = 0
+  if hparams.residual:
+    if hparams.num_encoder_layers > 1:
+      num_encoder_residual_layers = hparams.num_encoder_layers - 1
+    if hparams.num_decoder_layers > 1:
+      num_decoder_residual_layers = hparams.num_decoder_layers - 1
+
+    if hparams.encoder_type == "gnmt":
+      # The first unidirectional layer (after the bi-directional layer) in
+      # the GNMT encoder can't have residual connection due to the input is
+      # the concatenation of fw_cell and bw_cell's outputs.
+      num_encoder_residual_layers = hparams.num_encoder_layers - 2
+
+      # Compatible for GNMT models
+      if hparams.num_encoder_layers == hparams.num_decoder_layers:
+        num_decoder_residual_layers = num_encoder_residual_layers
+  hparams.add_hparam("num_encoder_residual_layers", num_encoder_residual_layers)
+  hparams.add_hparam("num_decoder_residual_layers", num_decoder_residual_layers)
+
+  if hparams.subword_option and hparams.subword_option not in ["spm", "bpe"]:
+    raise ValueError("subword option must be either spm, or bpe")
+
+  # Flags
+  utils.print_out("# hparams:")
+  utils.print_out("  src=%s" % hparams.src)
+  utils.print_out("  tgt=%s" % hparams.tgt)
+  utils.print_out("  train_prefix=%s" % hparams.train_prefix)
+  utils.print_out("  dev_prefix=%s" % hparams.dev_prefix)
+  utils.print_out("  test_prefix=%s" % hparams.test_prefix)
+  utils.print_out("  out_dir=%s" % hparams.out_dir)
+
+  ## Vocab
+  # Get vocab file names first
+  if hparams.vocab_prefix:
+    src_vocab_file = hparams.vocab_prefix + "." + hparams.src
+    tgt_vocab_file = hparams.vocab_prefix + "." + hparams.tgt
+  else:
+    raise ValueError("hparams.vocab_prefix must be provided.")
+
+  # Source vocab
+  src_vocab_size, src_vocab_file = vocab_utils.check_vocab(
+      src_vocab_file,
+      hparams.out_dir,
+      check_special_token=hparams.check_special_token,
+      sos=hparams.sos,
+      eos=hparams.eos,
+      unk=vocab_utils.UNK)
+
+  # Target vocab
+  if hparams.share_vocab:
+    utils.print_out("  using source vocab for target")
+    tgt_vocab_file = src_vocab_file
+    tgt_vocab_size = src_vocab_size
+  else:
+    tgt_vocab_size, tgt_vocab_file = vocab_utils.check_vocab(
+        tgt_vocab_file,
+        hparams.out_dir,
+        check_special_token=hparams.check_special_token,
+        sos=hparams.sos,
+        eos=hparams.eos,
+        unk=vocab_utils.UNK)
+  hparams.add_hparam("src_vocab_size", src_vocab_size)
+  hparams.add_hparam("tgt_vocab_size", tgt_vocab_size)
+  hparams.add_hparam("src_vocab_file", src_vocab_file)
+  hparams.add_hparam("tgt_vocab_file", tgt_vocab_file)
+
+  # Pretrained Embeddings:
+  hparams.add_hparam("src_embed_file", "")
+  hparams.add_hparam("tgt_embed_file", "")
+  # if hparams.embed_prefix:
+  #   src_embed_file = hparams.embed_prefix + "." + hparams.src
+  #   tgt_embed_file = hparams.embed_prefix + "." + hparams.tgt
+  #
+  #   if tf.gfile.Exists(src_embed_file):
+  #     hparams.src_embed_file = src_embed_file
+  #
+  #   if tf.gfile.Exists(tgt_embed_file):
+  #     hparams.tgt_embed_file = tgt_embed_file
+
+  # Check out_dir
+  if not tf.gfile.Exists(hparams.out_dir):
+    utils.print_out("# Creating output directory %s ..." % hparams.out_dir)
+    tf.gfile.MakeDirs(hparams.out_dir)
+
+  # Evaluation
+  for metric in hparams.metrics:
+    hparams.add_hparam("best_" + metric, 0)  # larger is better
+    best_metric_dir = os.path.join(hparams.out_dir, "best_" + metric)
+    hparams.add_hparam("best_" + metric + "_dir", best_metric_dir)
+    tf.gfile.MakeDirs(best_metric_dir)
+
+    if hparams.avg_ckpts:
+      hparams.add_hparam("avg_best_" + metric, 0)  # larger is better
+      best_metric_dir = os.path.join(hparams.out_dir, "avg_best_" + metric)
+      hparams.add_hparam("avg_best_" + metric + "_dir", best_metric_dir)
+      tf.gfile.MakeDirs(best_metric_dir)
+
+  return hparams
+
+
+def ensure_compatible_hparams(hparams, default_hparams, hparams_path):
+  """Make sure the loaded hparams is compatible with new changes."""
+  default_hparams = utils.maybe_parse_standard_hparams(
+      default_hparams, hparams_path)
+
+  # For compatible reason, if there are new fields in default_hparams,
+  #   we add them to the current hparams
+  default_config = default_hparams.values()
+  config = hparams.values()
+  for key in default_config:
+    if key not in config:
+      hparams.add_hparam(key, default_config[key])
+
+  # Update all hparams' keys if override_loaded_hparams=True
+  if default_hparams.override_loaded_hparams:
+    for key in default_config:
+      if getattr(hparams, key) != default_config[key]:
+        utils.print_out("# Updating hparams.%s: %s -> %s" %
+                        (key, str(getattr(hparams, key)),
+                         str(default_config[key])))
+        setattr(hparams, key, default_config[key])
+  return hparams
+
+
+def create_or_load_hparams(
+    out_dir, default_hparams, hparams_path, save_hparams=True):
+  """Create hparams or load hparams from out_dir."""
+  hparams = utils.load_hparams(out_dir)
+  if not hparams:
+    hparams = default_hparams
+    hparams = utils.maybe_parse_standard_hparams(
+        hparams, hparams_path)
+    hparams = extend_hparams(hparams)
+  else:
+    hparams = ensure_compatible_hparams(hparams, default_hparams, hparams_path)
+
+  # Save HParams
+  if save_hparams:
+    utils.save_hparams(out_dir, hparams)
+    for metric in hparams.metrics:
+      utils.save_hparams(getattr(hparams, "best_" + metric + "_dir"), hparams)
+
+  # Print HParams
+  utils.print_hparams(hparams)
+  return hparams
+
+
+def run_main(flags, default_hparams, train_fn, inference_fn, target_session=""):
+  """Run main."""
+  # Job
+  jobid = flags.jobid
+  num_workers = flags.num_workers
+  utils.print_out("# Job id %d" % jobid)
+
+  # Random
+  random_seed = flags.random_seed
+  if random_seed is not None and random_seed > 0:
+    utils.print_out("# Set random seed to %d" % random_seed)
+    random.seed(random_seed + jobid)
+    np.random.seed(random_seed + jobid)
+
+  ## Train / Decode
+  out_dir = flags.out_dir
+  if not tf.gfile.Exists(out_dir): tf.gfile.MakeDirs(out_dir)
+
+  # Load hparams.
+  hparams = create_or_load_hparams(
+      out_dir, default_hparams, flags.hparams_path, save_hparams=(jobid == 0))
+
+  if flags.inference_input_file:
+    # Inference indices
+    hparams.inference_indices = None
+    if flags.inference_list:
+      (hparams.inference_indices) = (
+          [int(token)  for token in flags.inference_list.split(",")])
+
+    # Inference
+    trans_file = flags.inference_output_file
+    ckpt = flags.ckpt
+    if not ckpt:
+      ckpt = tf.train.latest_checkpoint(out_dir)
+    inference_fn(ckpt, flags.inference_input_file,
+                 trans_file, hparams, num_workers, jobid)
+
+    # Evaluation
+    ref_file = flags.inference_ref_file
+    if ref_file and tf.gfile.Exists(trans_file):
+      for metric in hparams.metrics:
+        score = evaluation_utils.evaluate(
+            ref_file,
+            trans_file,
+            metric,
+            hparams.subword_option)
+        utils.print_out("  %s: %.1f" % (metric, score))
+  else:
+    # Train
+    train_fn(hparams, target_session=target_session)
+
+
+def main(unused_argv):
+  default_hparams = create_hparams(FLAGS)
+  train_fn = train.train
+  inference_fn = inference.inference
+  run_main(FLAGS, default_hparams, train_fn, inference_fn)
+
+
+if __name__ == "__main__":
+  nmt_parser = argparse.ArgumentParser()
+  add_arguments(nmt_parser)
+  FLAGS, unparsed = nmt_parser.parse_known_args()
+  tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)

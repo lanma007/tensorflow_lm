@@ -31,7 +31,6 @@ __all__ = [
     "ScheduledOutputTrainingHelper",
     "InferenceHelper",
 ]
-output_length = 20
 _transpose_batch_time = decoder._transpose_batch_time  # pylint: disable=protected-access
 
 
@@ -77,6 +76,10 @@ class Helper(object):
     """Returns `(initial_finished, initial_inputs)`."""
     pass
 
+  @abc.abstractmethod
+  def sample(self, time, outputs, state, name=None):
+    """Returns `sample_ids`."""
+    pass
 
   @abc.abstractmethod
   def next_inputs(self, time, outputs, state, sample_ids, name=None):
@@ -210,6 +213,11 @@ class TrainingHelper(Helper):
           lambda: nest.map_structure(lambda inp: inp.read(0), self._input_tas))
       return (finished, next_inputs)
 
+  def sample(self, time, outputs, name=None, **unused_kwargs):
+    with ops.name_scope(name, "TrainingHelperSample", [time, outputs]):
+      sample_ids = math_ops.cast(
+          math_ops.argmax(outputs, axis=-1), dtypes.int32)
+      return sample_ids
 
   def next_inputs(self, time, outputs, state, name=None, **unused_kwargs):
     """next_inputs_fn for TrainingHelper."""
@@ -651,21 +659,8 @@ class InferenceHelper(Helper):
 class LanHelper(Helper):
   """A helper to use during inference with a custom sampling function."""
 
-  def __init__(self, start_inputs, sequence_length):
-    """Initializer.
+  def __init__(self, start_inputs, sequence_length, time_major):
 
-    Args:
-      sample_fn: A callable that takes `outputs` and emits tensor `sample_ids`.
-      sample_shape: Either a list of integers, or a 1-D Tensor of type `int32`,
-        the shape of the each sample in the batch returned by `sample_fn`.
-      sample_dtype: the dtype of the sample returned by `sample_fn`.
-      start_inputs: The initial batch of inputs.
-      end_fn: A callable that takes `sample_ids` and emits a `bool` vector
-        shaped `[batch_size]` indicating whether each sample is an end token.
-      next_inputs_fn: (Optional) A callable that takes `sample_ids` and returns
-        the next batch of inputs. If not provided, `sample_ids` is used as the
-        next batch of inputs.
-    """
     self._sequence_length = sequence_length
     self._batch_size = array_ops.shape(start_inputs)[0]
     self._start_inputs = ops.convert_to_tensor(
@@ -701,3 +696,57 @@ class LanHelper(Helper):
     next_time=time+1
     finished = (next_time >= self._sequence_length)
     return (finished, next_inputs, state)
+
+  class LanInferenceHelper(Helper):
+    """A helper to use during inference with a custom sampling function."""
+
+    def __init__(self, sequence_length, time_major):
+      """Initializer.
+
+      Args:
+        sample_fn: A callable that takes `outputs` and emits tensor `sample_ids`.
+        sample_shape: Either a list of integers, or a 1-D Tensor of type `int32`,
+          the shape of the each sample in the batch returned by `sample_fn`.
+        sample_dtype: the dtype of the sample returned by `sample_fn`.
+        start_inputs: The initial batch of inputs.
+        end_fn: A callable that takes `sample_ids` and emits a `bool` vector
+          shaped `[batch_size]` indicating whether each sample is an end token.
+        next_inputs_fn: (Optional) A callable that takes `sample_ids` and returns
+          the next batch of inputs. If not provided, `sample_ids` is used as the
+          next batch of inputs.
+      """
+      self._sequence_length = sequence_length
+      self._batch_size = array_ops.shape(start_inputs)[0]
+      self._start_inputs = ops.convert_to_tensor(
+        start_inputs, name="start_inputs")
+
+    @property
+    def batch_size(self):
+      return self._batch_size
+
+    @property
+    def sample_ids_shape(self):
+      return tensor_shape.TensorShape([])
+
+    @property
+    def sequence_length(self):
+      return self._sequence_length
+
+    @property
+    def sample_ids_dtype(self):
+      return dtypes.int32
+
+    def initialize(self, name=None):
+      finished = array_ops.tile([False], [self._batch_size])
+      return (finished, self._start_inputs)
+
+    def sample(self, time, outputs, state, name=None):
+      del time, state  # unused by sample
+      return tf.identity(outputs[:, 0])
+
+    def next_inputs(self, time, outputs, state, sample_ids, name=None):
+      del time, outputs  # unused by next_inputs
+      next_inputs = outputs
+      next_time = time + 1
+      finished = (next_time >= self._sequence_length)
+      return (finished, next_inputs, state)

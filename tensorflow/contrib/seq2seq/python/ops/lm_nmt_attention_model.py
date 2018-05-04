@@ -38,9 +38,9 @@ class AttentionModel(model.Model):
                hparams,
                mode,
                iterator,
-               source_vocab_table,
-               target_vocab_table,
-               reverse_target_vocab_table=None,
+               #source_vocab_table,
+               #target_vocab_table,
+               #reverse_target_vocab_table=None,
                scope=None,
                extra_args=None):
     # Set attention_mechanism_fn
@@ -114,7 +114,7 @@ class AttentionModel(model.Model):
     # Only generate alignment in greedy INFER mode.
     alignment_history = (self.mode == tf.contrib.learn.ModeKeys.INFER and
                          beam_width == 0)
-    cell = tf.contrib.seq2seq.AttentionWrapper(
+    cell = tf.contrib.seq2seq.AttentionWrapper( #from attention_wrapper_lm
         cell,
         attention_mechanism,
         attention_layer_size=num_units,

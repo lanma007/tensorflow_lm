@@ -720,7 +720,7 @@ class AttentionWrapper(rnn_cell_impl.RNNCell):
             a = tf.nn.softmax(s)
         with variable_scope.variable_scope("BetaEncoder"):
             # b = math_ops.reduce_sum(v_1 * math_ops.tanh(hidden_features_1 + y_1), [1, 3])
-            y_1 = linear(state, size, True)
+            y_1 = linear(query, size, True)
             b = v_1 * tf.nn.tanh(attn_state + y_1)  # +v_3*tf.nn.tanh(incs)
             # beta= tf.nn.softmax(b)
             # b = tf.reduce_sum(v_1 * tf.nn.tanh(hidden_features_1[:,i,:,:] ), [1]) +v_3*tf.nn.tanh(incs)  #no
