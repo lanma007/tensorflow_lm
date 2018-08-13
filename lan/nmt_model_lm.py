@@ -78,6 +78,20 @@ class BaseModel(object):
     if extra_args:
       self.single_cell_fn = extra_args.single_cell_fn
 
+      # Set num layers
+    self.num_encoder_layers = hparams.num_encoder_layers
+    self.num_decoder_layers = hparams.num_decoder_layers
+    assert self.num_encoder_layers
+    assert self.num_decoder_layers
+
+    # Set num residual layers
+    if hasattr(hparams, "num_residual_layers"):  # compatible common_test_utils
+      self.num_encoder_residual_layers = hparams.num_residual_layers
+      self.num_decoder_residual_layers = hparams.num_residual_layers
+    else:
+      self.num_encoder_residual_layers = hparams.num_encoder_residual_layers
+      self.num_decoder_residual_layers = hparams.num_decoder_residual_layers
+
     # Initializer
     initializer = model_helper.get_initializer(
         hparams.init_op, hparams.random_seed, hparams.init_weight)
@@ -301,14 +315,14 @@ class BaseModel(object):
 
 
     source = iterator.source
-    if self.time_major:
-      source = tf.transpose(source)
+    # if self.time_major:
+    #   source = tf.transpose(source)
 
     ## Decoder.
     with tf.variable_scope("encoder") as scope:
       dtype = scope.dtype
-      cell = self._build_encoder_cell(
-        hparams, num_layers, num_residual_layers)
+      cell, encoder_initial_state = self._build_encoder_cell(
+        hparams, num_layers)
 
 
         # Helper
@@ -316,7 +330,7 @@ class BaseModel(object):
           source, iterator.source_sequence_length,
           time_major=self.time_major)
 
-      encoder_initial_state= cell.zero_state(self.batch_size, dtype)
+      # encoder_initial_state= cell.zero_state(self.batch_size, dtype)
 
         # Decoder
       my_encoder = basic_decoder_lm.BasicDecoder(
@@ -625,7 +639,7 @@ class AttentionModel(BaseModel):
 
     num_units = hparams.num_units
     num_layers = hparams.num_layers
-    num_residual_layers = hparams.num_residual_layers
+    num_residual_layers = hparams.num_decoder_residual_layers
     num_gpus = hparams.num_gpus
     beam_width = hparams.beam_width
 
@@ -690,7 +704,7 @@ class AttentionModel(BaseModel):
     return cell, decoder_initial_state
 
 
-  def _build_encoder_cell(self, hparams, num_layers, num_residual_layers):
+  def _build_encoder_cell(self, hparams, num_layers):
     """Build a RNN cell with attention mechanism that can be used by decoder."""
     attention_option = hparams.attention
     # attention_architecture = hparams.attention_architecture
@@ -701,17 +715,19 @@ class AttentionModel(BaseModel):
 
     num_units = hparams.num_units
     num_layers = hparams.num_layers
-    num_residual_layers = hparams.num_residual_layers
+    num_residual_layers = hparams.num_encoder_residual_layers
     num_gpus = hparams.num_gpus
     beam_width = hparams.beam_width
 
     dtype = tf.float32
+    batch_size = self.batch_size
 
-    # Ensure memory is batch-major
+    #Ensure memory is batch-major
     # if self.time_major:
     #   memory = tf.transpose(encoder_outputs, [1, 0, 2])
     # else:
     #   memory = encoder_outputs
+    memory = tf.zeros([batch_size,hparams.src_max_len, num_units])
 
     # if self.mode == tf.contrib.learn.ModeKeys.INFER and beam_width > 0:
     #   # memory = tf.contrib.seq2seq.tile_batch(
@@ -722,10 +738,9 @@ class AttentionModel(BaseModel):
     #     encoder_state, multiplier=beam_width)
     #   batch_size = self.batch_size * beam_width
     # else:
-    batch_size = self.batch_size
 
     attention_mechanism = self.attention_mechanism_fn(
-      'Lan', num_units, self.mode)
+      'Lan', num_units, memory, self.mode)
 
     cell = model_helper.create_rnn_cell(
       unit_type=hparams.unit_type,

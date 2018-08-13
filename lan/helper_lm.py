@@ -712,10 +712,11 @@ class LanEncoderHelper(Helper):
     self._sequence_length = ops.convert_to_tensor(
       sequence_length, name="sequence_length")
     self._batch_size = array_ops.size(sequence_length)
+    if not time_major:
+      inputs = nest.map_structure(_transpose_batch_time, inputs)
     self._inputs = ops.convert_to_tensor(
       inputs, name="inputs")
-    # self._input_tas = nest.map_structure(_unstack_ta, self._inputs)
-    self._input_tas = self._inputs
+    self._input_tas = nest.map_structure(_unstack_ta, self._inputs)
     self._zero_inputs = nest.map_structure(
       lambda inp: array_ops.zeros_like(inp[0, :]), inputs)
 
@@ -737,8 +738,7 @@ class LanEncoderHelper(Helper):
 
   def initialize(self, name=None):
     finished = math_ops.equal(0, self._sequence_length)
-    # start_inputs= nest.map_structure(lambda inp: inp.read(0), self._input_tas)
-    start_inputs= nest.map_structure(lambda inp: inp[0,:], self._input_tas)
+    start_inputs= nest.map_structure(lambda inp: inp.read(0), self._input_tas)
     return (finished, start_inputs)
 
   def sample(self, time, outputs, state, name=None):
@@ -751,8 +751,7 @@ class LanEncoderHelper(Helper):
     finished = (next_time >= self._sequence_length)
     #all_finished = math_ops.reduce_all(finished)
     def read_from_ta(inp):
-      return inp[next_time,:]
-      # return inp.read(next_time)
+      return inp.read(next_time)
     next_inputs = nest.map_structure(read_from_ta, self._input_tas)
     return (finished, next_inputs, state)
 

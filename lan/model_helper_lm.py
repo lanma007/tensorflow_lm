@@ -8,10 +8,10 @@ import tensorflow as tf
 
 from tensorflow.python.ops import lookup_ops
 
-from .utils import iterator_utils_lm
-from .utils import misc_utils as utils
-from .utils import vocab_utils
-from .utils import Data_prep_seq2seq as GD
+from . import iterator_utils_lm
+from . import misc_utils as utils
+from . import vocab_utils
+from . import Data_prep_seq2seq as GD
 
 
 __all__ = [

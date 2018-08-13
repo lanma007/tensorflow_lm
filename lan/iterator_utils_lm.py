@@ -141,7 +141,7 @@ def get_iterator(src_dataset,
   #   batched_dataset = src_tgt_dataset.apply(
   #       tf.contrib.data.group_by_window(
   #           key_func=key_func, reduce_func=reduce_func, window_size=batch_size))
-  #
+  # #
   # else:
   batched_dataset = batching_func(src_tgt_dataset)
   batched_iter = batched_dataset.make_initializable_iterator()

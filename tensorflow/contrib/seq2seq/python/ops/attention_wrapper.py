@@ -428,7 +428,7 @@ class LuongAttention(_BaseAttentionMechanism):
     with variable_scope.variable_scope(None, "luong_attention", [query]):
       score = _luong_score(query, self._keys, self._scale)
     alignments = self._probability_fn(score, state)
-    next_state = alignments
+    next_staate = alignments
     return alignments, next_state
 
 
